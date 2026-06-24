@@ -23,8 +23,27 @@ export interface PixelForgeSettings {
   autoUpdate: boolean;
 }
 
+export interface ReferenceFile {
+  id: string;
+  name: string;
+  path: string;
+  mimeType: string;
+  size: number;
+  addedAt: string;
+}
+
+export interface PixelForgeProject {
+  id: string;
+  name: string;
+  outputDir: string;
+  referenceFiles: ReferenceFile[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ImageGeneration {
   id: string;
+  projectId: string;
   prompt: string;
   provider: ImageProvider;
   outputPath: string;
@@ -36,14 +55,18 @@ export interface ImageGeneration {
   batchId: string;
   index: number;
   summaryPath: string;
+  referenceFilePaths: string[];
 }
 
 export interface PixelForgeState {
   settings: PixelForgeSettings;
+  projects: PixelForgeProject[];
+  activeProjectId: string;
   generations: ImageGeneration[];
 }
 
 export interface GenerateImagesRequest {
+  projectId: string;
   prompt: string;
   settings: PixelForgeSettings;
 }

@@ -1,7 +1,8 @@
 import { app, safeStorage } from "electron";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { ImageGeneration, PixelForgeSettings, PixelForgeState, SecretStatus } from "./types.js";
+import crypto from "node:crypto";
+import type { ImageGeneration, PixelForgeProject, PixelForgeSettings, PixelForgeState, ReferenceFile, SecretStatus } from "./types.js";
 
 const defaultSettings: PixelForgeSettings = {
   provider: "codex",
@@ -41,13 +42,26 @@ export class PixelForgeStore {
     await mkdir(this.defaultOutputRoot, { recursive: true });
     try {
       const parsed = JSON.parse(await readFile(this.dataPath, "utf8")) as Partial<PixelForgeState>;
+      const settings = this.normalizeSettings(parsed.settings);
+      const projects = await this.normalizeProjects(parsed.projects, settings);
+      const activeProjectId = projects.some((project) => project.id === parsed.activeProjectId)
+        ? parsed.activeProjectId ?? projects[0].id
+        : projects[0].id;
       return {
-        settings: this.normalizeSettings(parsed.settings),
-        generations: (parsed.generations ?? []).map(normalizeGeneration).filter((generation): generation is ImageGeneration => Boolean(generation))
+        settings,
+        projects,
+        activeProjectId,
+        generations: (parsed.generations ?? [])
+          .map((generation) => normalizeGeneration(generation, activeProjectId))
+          .filter((generation): generation is ImageGeneration => Boolean(generation))
       };
     } catch {
+      const settings = this.normalizeSettings(undefined);
+      const project = await this.createDefaultProject(settings);
       const state: PixelForgeState = {
-        settings: this.normalizeSettings(undefined),
+        settings,
+        projects: [project],
+        activeProjectId: project.id,
         generations: []
       };
       await this.save(state);
@@ -65,6 +79,131 @@ export class PixelForgeStore {
     state.settings = this.normalizeSettings(settings);
     await this.save(state);
     return state.settings;
+  }
+
+  async createProject(name: string): Promise<PixelForgeState> {
+    const state = await this.load();
+    const now = new Date().toISOString();
+    const id = crypto.randomUUID();
+    const projectName = name.trim() || "Untitled Project";
+    const project: PixelForgeProject = {
+      id,
+      name: projectName,
+      outputDir: path.join(state.settings.outputRoot, "projects", `${sanitizeFileName(projectName)}-${id.slice(0, 8)}`),
+      referenceFiles: [],
+      createdAt: now,
+      updatedAt: now
+    };
+    await mkdir(project.outputDir, { recursive: true });
+    state.projects.unshift(project);
+    state.activeProjectId = project.id;
+    await this.save(state);
+    return state;
+  }
+
+  async updateProject(project: PixelForgeProject): Promise<PixelForgeProject> {
+    const state = await this.load();
+    const existing = state.projects.find((candidate) => candidate.id === project.id);
+    if (!existing) throw new Error("Project not found.");
+    const updated: PixelForgeProject = {
+      ...existing,
+      name: project.name.trim() || existing.name,
+      updatedAt: new Date().toISOString()
+    };
+    state.projects = state.projects.map((candidate) => candidate.id === updated.id ? updated : candidate);
+    await this.save(state);
+    return updated;
+  }
+
+  async setActiveProject(projectId: string): Promise<PixelForgeState> {
+    const state = await this.load();
+    if (!state.projects.some((project) => project.id === projectId)) {
+      throw new Error("Project not found.");
+    }
+    state.activeProjectId = projectId;
+    await this.save(state);
+    return state;
+  }
+
+  async deleteProject(projectId: string): Promise<PixelForgeState> {
+    const state = await this.load();
+    if (state.projects.length <= 1) {
+      throw new Error("At least one project is required.");
+    }
+    const project = state.projects.find((candidate) => candidate.id === projectId);
+    if (!project) throw new Error("Project not found.");
+
+    state.projects = state.projects.filter((candidate) => candidate.id !== projectId);
+    state.generations = state.generations.filter((generation) => generation.projectId !== projectId);
+    state.activeProjectId = state.projects[0].id;
+    await this.save(state);
+
+    const outputRoot = path.resolve(state.settings.outputRoot);
+    const outputDir = path.resolve(project.outputDir);
+    if (outputDir.startsWith(outputRoot + path.sep)) {
+      await rm(outputDir, { recursive: true, force: true });
+    }
+    return state;
+  }
+
+  async addReferenceFiles(projectId: string, filePaths: string[]): Promise<PixelForgeProject> {
+    const state = await this.load();
+    const project = state.projects.find((candidate) => candidate.id === projectId);
+    if (!project) throw new Error("Project not found.");
+    const referencesDir = path.join(project.outputDir, "references");
+    await mkdir(referencesDir, { recursive: true });
+
+    const added: ReferenceFile[] = [];
+    for (const sourcePath of filePaths) {
+      if (!isSupportedReferenceImage(sourcePath)) continue;
+      const sourceStat = await stat(sourcePath);
+      if (!sourceStat.isFile()) continue;
+      const extension = path.extname(sourcePath).toLowerCase();
+      const id = crypto.randomUUID();
+      const name = path.basename(sourcePath);
+      const targetPath = path.join(referencesDir, `${sanitizeFileName(path.basename(sourcePath, extension))}-${id.slice(0, 8)}${extension}`);
+      await copyFile(sourcePath, targetPath);
+      added.push({
+        id,
+        name,
+        path: targetPath,
+        mimeType: mimeTypeForFile(targetPath),
+        size: sourceStat.size,
+        addedAt: new Date().toISOString()
+      });
+    }
+
+    const updated: PixelForgeProject = {
+      ...project,
+      referenceFiles: [...added, ...project.referenceFiles],
+      updatedAt: new Date().toISOString()
+    };
+    state.projects = state.projects.map((candidate) => candidate.id === projectId ? updated : candidate);
+    await this.save(state);
+    return updated;
+  }
+
+  async removeReferenceFile(projectId: string, referenceId: string): Promise<PixelForgeProject> {
+    const state = await this.load();
+    const project = state.projects.find((candidate) => candidate.id === projectId);
+    if (!project) throw new Error("Project not found.");
+    const reference = project.referenceFiles.find((candidate) => candidate.id === referenceId);
+    const updated: PixelForgeProject = {
+      ...project,
+      referenceFiles: project.referenceFiles.filter((candidate) => candidate.id !== referenceId),
+      updatedAt: new Date().toISOString()
+    };
+    state.projects = state.projects.map((candidate) => candidate.id === projectId ? updated : candidate);
+    await this.save(state);
+
+    if (reference?.path) {
+      const outputDir = path.resolve(project.outputDir);
+      const referencePath = path.resolve(reference.path);
+      if (referencePath.startsWith(outputDir + path.sep)) {
+        await rm(referencePath, { force: true });
+      }
+    }
+    return updated;
   }
 
   async addGenerations(generations: ImageGeneration[]): Promise<ImageGeneration[]> {
@@ -149,6 +288,31 @@ export class PixelForgeStore {
     };
   }
 
+  private async normalizeProjects(projects: PixelForgeProject[] | undefined, settings: PixelForgeSettings): Promise<PixelForgeProject[]> {
+    const normalized = (projects ?? []).map((project) => normalizeProject(project)).filter((project): project is PixelForgeProject => Boolean(project));
+    if (!normalized.length) {
+      normalized.push(await this.createDefaultProject(settings));
+    }
+    for (const project of normalized) {
+      await mkdir(project.outputDir, { recursive: true });
+    }
+    return normalized.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  private async createDefaultProject(settings: PixelForgeSettings): Promise<PixelForgeProject> {
+    const now = new Date().toISOString();
+    const outputDir = path.join(settings.outputRoot || this.defaultOutputRoot, "projects", "default-project");
+    await mkdir(outputDir, { recursive: true });
+    return {
+      id: "default-project",
+      name: "Default Project",
+      outputDir,
+      referenceFiles: [],
+      createdAt: now,
+      updatedAt: now
+    };
+  }
+
   private async readSecrets(): Promise<SecretFile> {
     try {
       return JSON.parse(await readFile(this.secretPath, "utf8")) as SecretFile;
@@ -167,10 +331,36 @@ export class PixelForgeStore {
   }
 }
 
-function normalizeGeneration(value: Partial<ImageGeneration>): ImageGeneration | null {
+function normalizeProject(value: Partial<PixelForgeProject>): PixelForgeProject | null {
+  if (!value.id || !value.name || !value.outputDir) return null;
+  const timestamp = value.updatedAt ?? value.createdAt ?? new Date().toISOString();
+  return {
+    id: value.id,
+    name: value.name,
+    outputDir: value.outputDir,
+    referenceFiles: (value.referenceFiles ?? []).map(normalizeReferenceFile).filter((reference): reference is ReferenceFile => Boolean(reference)),
+    createdAt: value.createdAt ?? timestamp,
+    updatedAt: timestamp
+  };
+}
+
+function normalizeReferenceFile(value: Partial<ReferenceFile>): ReferenceFile | null {
+  if (!value.id || !value.path) return null;
+  return {
+    id: value.id,
+    name: value.name ?? path.basename(value.path),
+    path: value.path,
+    mimeType: value.mimeType ?? mimeTypeForFile(value.path),
+    size: value.size ?? 0,
+    addedAt: value.addedAt ?? new Date().toISOString()
+  };
+}
+
+function normalizeGeneration(value: Partial<ImageGeneration>, fallbackProjectId: string): ImageGeneration | null {
   if (!value.id || !value.createdAt) return null;
   return {
     id: value.id,
+    projectId: value.projectId ?? fallbackProjectId,
     prompt: value.prompt ?? "",
     provider: value.provider === "openai" ? "openai" : "codex",
     outputPath: value.outputPath ?? "",
@@ -181,7 +371,8 @@ function normalizeGeneration(value: Partial<ImageGeneration>): ImageGeneration |
     size: value.size ?? "",
     batchId: value.batchId ?? "",
     index: value.index ?? 1,
-    summaryPath: value.summaryPath ?? ""
+    summaryPath: value.summaryPath ?? "",
+    referenceFilePaths: value.referenceFilePaths ?? []
   };
 }
 
@@ -189,4 +380,25 @@ function clampInteger(value: unknown, min: number, max: number, fallback: number
   const parsed = Math.floor(Number(value));
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(min, Math.min(max, parsed));
+}
+
+function sanitizeFileName(value: string): string {
+  return value
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 80) || "pixelforge";
+}
+
+function isSupportedReferenceImage(filePath: string): boolean {
+  return [".png", ".jpg", ".jpeg", ".webp"].includes(path.extname(filePath).toLowerCase());
+}
+
+function mimeTypeForFile(filePath: string): string {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === ".png") return "image/png";
+  if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
+  if (extension === ".webp") return "image/webp";
+  return "application/octet-stream";
 }

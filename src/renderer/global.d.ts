@@ -2,6 +2,7 @@ import type {
   GenerateImagesRequest,
   GenerateImagesResult,
   ImageGeneration,
+  PixelForgeProject,
   PixelForgeSettings,
   PixelForgeState,
   SecretStatus,
@@ -15,6 +16,12 @@ declare global {
     pixelforge: {
       loadState: () => Promise<PixelForgeState>;
       updateSettings: (settings: PixelForgeSettings) => Promise<PixelForgeSettings>;
+      createProject: (name: string) => Promise<PixelForgeState>;
+      updateProject: (project: PixelForgeProject) => Promise<PixelForgeProject>;
+      deleteProject: (projectId: string) => Promise<PixelForgeState>;
+      setActiveProject: (projectId: string) => Promise<PixelForgeState>;
+      addProjectReferenceFiles: (projectId: string) => Promise<PixelForgeProject>;
+      removeProjectReferenceFile: (projectId: string, referenceId: string) => Promise<PixelForgeProject>;
       chooseOutputRoot: () => Promise<string | null>;
       generateImages: (request: GenerateImagesRequest) => Promise<GenerateImagesResult>;
       deleteGeneration: (generationId: string) => Promise<string>;

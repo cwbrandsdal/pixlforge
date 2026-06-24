@@ -2,7 +2,7 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, shell } fr
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, existsSync, statSync } from "node:fs";
-import { copyFile, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -12,7 +12,9 @@ import type {
   GenerateImagesRequest,
   GenerateImagesResult,
   ImageGeneration,
+  PixelForgeProject,
   PixelForgeSettings,
+  ReferenceFile,
   UpdateState
 } from "./types.js";
 
@@ -188,6 +190,10 @@ function isImagePath(filePath: string): boolean {
   return [".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(path.extname(filePath).toLowerCase());
 }
 
+function isSupportedReferenceImage(filePath: string): boolean {
+  return [".png", ".jpg", ".jpeg", ".webp"].includes(path.extname(filePath).toLowerCase());
+}
+
 function normalizeCodexReasoningEffort(value: PixelForgeSettings["codexReasoningEffort"]): PixelForgeSettings["codexReasoningEffort"] {
   return value === "medium" || value === "high" || value === "xhigh" ? value : "low";
 }
@@ -200,12 +206,15 @@ function sizeForAspectRatio(aspectRatio: PixelForgeSettings["aspectRatio"]): str
   return "1024x1024";
 }
 
-function buildCodexImagePrompt(prompt: string, settings: PixelForgeSettings): string {
+function buildCodexImagePrompt(prompt: string, settings: PixelForgeSettings, referenceFiles: ReferenceFile[]): string {
   const count = Math.max(1, Math.min(10, Math.floor(settings.count)));
   const variants = Array.from({ length: count }, (_value, index) => {
     const variant = index + 1;
     return `Variant ${variant}: Change composition, crop, lighting, color balance, foreground/background hierarchy, and focal emphasis while preserving the user's subject and constraints.`;
   }).join("\n");
+  const references = referenceFiles.length
+    ? referenceFiles.map((file, index) => `${index + 1}. ${file.name}: attached image ${index + 1}; source path ${file.path}`).join("\n")
+    : "No reference images were attached.";
 
   return [
     "$imagegen",
@@ -218,6 +227,12 @@ function buildCodexImagePrompt(prompt: string, settings: PixelForgeSettings): st
     "",
     "User prompt:",
     prompt.trim(),
+    "",
+    "Reference images:",
+    references,
+    referenceFiles.length
+      ? "Use these attached reference images for logos, brand details, products, art direction, or source visual material when the prompt asks for them."
+      : "",
     "",
     "Variant directions:",
     variants,
@@ -237,6 +252,8 @@ function buildCodexImagePrompt(prompt: string, settings: PixelForgeSettings): st
 async function runCodexGeneration(
   prompt: string,
   settings: PixelForgeSettings,
+  project: PixelForgeProject,
+  referenceFiles: ReferenceFile[],
   emitLog: (message: string, stream?: "info" | "stdout" | "stderr" | "error") => void
 ): Promise<ImageGeneration[]> {
   const codexPath = findOnPath("codex");
@@ -248,7 +265,7 @@ async function runCodexGeneration(
   const createdAt = new Date().toISOString();
   const batchId = randomUUID();
   const batchStamp = createdAt.replace(/[:.]/g, "-");
-  const outputDir = path.join(settings.outputRoot, "codex", batchStamp);
+  const outputDir = path.join(project.outputDir, "generations", "codex", batchStamp);
   const summaryPath = path.join(outputDir, "codex-summary.md");
   const jobStartedAt = new Date();
   await mkdir(outputDir, { recursive: true });
@@ -272,12 +289,21 @@ async function runCodexGeneration(
   if (settings.codexModel.trim()) {
     args.push("--model", settings.codexModel.trim());
   }
+  for (const referenceFile of referenceFiles) {
+    if (existsSync(referenceFile.path)) {
+      args.push("--image", referenceFile.path);
+    }
+  }
   args.push("-");
 
   emitLog(`Starting Codex batch for ${count} image${count === 1 ? "" : "s"}.`);
+  emitLog(`Project: ${project.name}`);
   emitLog(`Codex CLI: ${codexPath}`);
   emitLog(`Output: ${outputDir}`);
   emitLog(`Reasoning effort: ${normalizeCodexReasoningEffort(settings.codexReasoningEffort)}.`);
+  if (referenceFiles.length) {
+    emitLog(`Attached ${referenceFiles.length} reference image${referenceFiles.length === 1 ? "" : "s"}.`);
+  }
 
   return new Promise<ImageGeneration[]>((resolve) => {
     let stdoutRemainder = "";
@@ -312,16 +338,16 @@ async function runCodexGeneration(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       emitLog(`Codex failed to start: ${message}`, "error");
-      resolve(buildFailedResults(prompt, "codex", count, settings.codexModel || "codex", sizeForAspectRatio(settings.aspectRatio), batchId, summaryPath, message));
+      resolve(buildFailedResults(prompt, "codex", count, settings.codexModel || "codex", sizeForAspectRatio(settings.aspectRatio), batchId, summaryPath, message, project.id, referenceFiles));
       return;
     }
 
-    child.stdin?.end(buildCodexImagePrompt(prompt, settings));
+    child.stdin?.end(buildCodexImagePrompt(prompt, settings, referenceFiles));
     child.stdout?.on("data", (chunk: Buffer) => handleChunk("stdout", chunk));
     child.stderr?.on("data", (chunk: Buffer) => handleChunk("stderr", chunk));
     child.on("error", (error) => {
       emitLog(`Codex failed to start: ${error.message}`, "error");
-      resolve(buildFailedResults(prompt, "codex", count, settings.codexModel || "codex", sizeForAspectRatio(settings.aspectRatio), batchId, summaryPath, error.message));
+      resolve(buildFailedResults(prompt, "codex", count, settings.codexModel || "codex", sizeForAspectRatio(settings.aspectRatio), batchId, summaryPath, error.message, project.id, referenceFiles));
     });
     child.on("close", async (code) => {
       flushLine("stdout", stdoutRemainder);
@@ -329,7 +355,7 @@ async function runCodexGeneration(
       if (code !== 0) {
         const error = lastError || `Codex exited with code ${code ?? "unknown"}.`;
         emitLog(error, "error");
-        resolve(buildFailedResults(prompt, "codex", count, settings.codexModel || "codex", sizeForAspectRatio(settings.aspectRatio), batchId, summaryPath, error));
+        resolve(buildFailedResults(prompt, "codex", count, settings.codexModel || "codex", sizeForAspectRatio(settings.aspectRatio), batchId, summaryPath, error, project.id, referenceFiles));
         return;
       }
 
@@ -340,14 +366,14 @@ async function runCodexGeneration(
         if (!generatedImage) {
           const error = `Codex generated ${generatedImages.length}/${count} discoverable image files.`;
           emitLog(`Image ${index} missing: ${error}`, "error");
-          results.push(buildGeneration(prompt, "codex", "", "failed", error, settings.codexModel || "codex", sizeForAspectRatio(settings.aspectRatio), batchId, index, summaryPath));
+          results.push(buildGeneration(prompt, "codex", "", "failed", error, settings.codexModel || "codex", sizeForAspectRatio(settings.aspectRatio), batchId, index, summaryPath, project.id, referenceFiles));
           continue;
         }
 
         const outputPath = path.join(outputDir, `${sanitizeFileName(prompt)}-${index}.png`);
         await copyFile(generatedImage, outputPath);
         emitLog(`Saved Codex image ${index}/${count}: ${outputPath}`);
-        results.push(buildGeneration(prompt, "codex", outputPath, "completed", "", settings.codexModel || "codex", sizeForAspectRatio(settings.aspectRatio), batchId, index, summaryPath));
+        results.push(buildGeneration(prompt, "codex", outputPath, "completed", "", settings.codexModel || "codex", sizeForAspectRatio(settings.aspectRatio), batchId, index, summaryPath, project.id, referenceFiles));
       }
       resolve(results);
     });
@@ -404,6 +430,8 @@ async function collectGeneratedImages(
 async function runOpenAiGeneration(
   prompt: string,
   settings: PixelForgeSettings,
+  project: PixelForgeProject,
+  referenceFiles: ReferenceFile[],
   emitLog: (message: string, stream?: "info" | "stdout" | "stderr" | "error") => void
 ): Promise<ImageGeneration[]> {
   const apiKey = await store.getOpenAiApiKey();
@@ -415,14 +443,18 @@ async function runOpenAiGeneration(
   const createdAt = new Date().toISOString();
   const batchId = randomUUID();
   const batchStamp = createdAt.replace(/[:.]/g, "-");
-  const outputDir = path.join(settings.outputRoot, "openai", batchStamp);
+  const outputDir = path.join(project.outputDir, "generations", "openai", batchStamp);
   const summaryPath = path.join(outputDir, "openai-request.json");
   await mkdir(outputDir, { recursive: true });
 
   emitLog(`Starting OpenAI Images API batch for ${count} image${count === 1 ? "" : "s"}.`);
+  emitLog(`Project: ${project.name}`);
   emitLog(`Model: ${settings.openAiModel}`);
   emitLog(`Size: ${settings.openAiSize}`);
   emitLog(`Output: ${outputDir}`);
+  if (referenceFiles.length) {
+    emitLog(`Using ${referenceFiles.length} reference image${referenceFiles.length === 1 ? "" : "s"} through the image edits endpoint.`);
+  }
 
   const results: ImageGeneration[] = [];
   const requests = settings.openAiModel === "dall-e-3"
@@ -438,12 +470,18 @@ async function runOpenAiGeneration(
     quality: settings.openAiQuality,
     output_format: settings.openAiFormat,
     moderation: settings.openAiModeration,
+    referenceFiles: referenceFiles.map((file) => ({ name: file.name, path: file.path, mimeType: file.mimeType })),
     createdAt
   }, null, 2), "utf8");
 
   for (const requestCount of requests) {
-    const body = buildOpenAiRequestBody(prompt, settings, requestCount);
-    const response = await fetch("https://api.openai.com/v1/images/generations", {
+    const endpoint = referenceFiles.length
+      ? "https://api.openai.com/v1/images/edits"
+      : "https://api.openai.com/v1/images/generations";
+    const body = referenceFiles.length
+      ? await buildOpenAiEditRequestBody(prompt, settings, requestCount, referenceFiles)
+      : buildOpenAiRequestBody(prompt, settings, requestCount);
+    const response = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${apiKey}`,
@@ -456,7 +494,7 @@ async function runOpenAiGeneration(
       const error = await readOpenAiError(response);
       emitLog(error, "error");
       const remaining = count - results.length;
-      results.push(...buildFailedResults(prompt, "openai", remaining, settings.openAiModel, settings.openAiSize, batchId, summaryPath, error, results.length));
+      results.push(...buildFailedResults(prompt, "openai", remaining, settings.openAiModel, settings.openAiSize, batchId, summaryPath, error, project.id, referenceFiles, results.length));
       break;
     }
 
@@ -474,11 +512,11 @@ async function runOpenAiGeneration(
       if (!bytes) {
         const error = "OpenAI returned an image item without base64 data or a URL.";
         emitLog(error, "error");
-        results.push(buildGeneration(prompt, "openai", "", "failed", error, settings.openAiModel, settings.openAiSize, batchId, imageIndex, summaryPath));
+        results.push(buildGeneration(prompt, "openai", "", "failed", error, settings.openAiModel, settings.openAiSize, batchId, imageIndex, summaryPath, project.id, referenceFiles));
       } else {
         await writeFile(outputPath, bytes);
         emitLog(`Saved OpenAI image ${imageIndex}/${count}: ${outputPath}`);
-        results.push(buildGeneration(prompt, "openai", outputPath, "completed", "", settings.openAiModel, settings.openAiSize, batchId, imageIndex, summaryPath));
+        results.push(buildGeneration(prompt, "openai", outputPath, "completed", "", settings.openAiModel, settings.openAiSize, batchId, imageIndex, summaryPath, project.id, referenceFiles));
       }
       imageIndex++;
     }
@@ -510,6 +548,48 @@ function buildOpenAiRequestBody(prompt: string, settings: PixelForgeSettings, co
     quality: ["low", "medium", "high", "auto"].includes(settings.openAiQuality) ? settings.openAiQuality : "auto",
     output_format: settings.openAiFormat,
     moderation: settings.openAiModeration
+  };
+}
+
+async function buildOpenAiEditRequestBody(
+  prompt: string,
+  settings: PixelForgeSettings,
+  count: number,
+  referenceFiles: ReferenceFile[]
+): Promise<Record<string, unknown>> {
+  const model = settings.openAiModel.trim() || "gpt-image-2";
+  if (model.startsWith("dall-e")) {
+    throw new Error("OpenAI reference images require a GPT Image model such as gpt-image-2.");
+  }
+
+  const images = [];
+  for (const referenceFile of referenceFiles.slice(0, 16)) {
+    if (!existsSync(referenceFile.path) || !["image/png", "image/jpeg", "image/webp"].includes(referenceFile.mimeType)) {
+      continue;
+    }
+    if (referenceFile.size > 20 * 1024 * 1024) {
+      continue;
+    }
+    const bytes = await readFile(referenceFile.path);
+    images.push({
+      image_url: `data:${referenceFile.mimeType};base64,${bytes.toString("base64")}`
+    });
+  }
+
+  if (!images.length) {
+    throw new Error("No supported reference images were available for the OpenAI request.");
+  }
+
+  return {
+    model,
+    prompt,
+    images,
+    n: count,
+    size: settings.openAiSize || sizeForAspectRatio(settings.aspectRatio),
+    quality: ["low", "medium", "high", "auto"].includes(settings.openAiQuality) ? settings.openAiQuality : "auto",
+    output_format: settings.openAiFormat,
+    moderation: settings.openAiModeration,
+    input_fidelity: "high"
   };
 }
 
@@ -547,10 +627,13 @@ function buildGeneration(
   size: string,
   batchId: string,
   index: number,
-  summaryPath: string
+  summaryPath: string,
+  projectId: string,
+  referenceFiles: ReferenceFile[]
 ): ImageGeneration {
   return {
     id: randomUUID(),
+    projectId,
     prompt,
     provider,
     outputPath,
@@ -561,7 +644,8 @@ function buildGeneration(
     size,
     batchId,
     index,
-    summaryPath
+    summaryPath,
+    referenceFilePaths: referenceFiles.map((file) => file.path)
   };
 }
 
@@ -574,10 +658,12 @@ function buildFailedResults(
   batchId: string,
   summaryPath: string,
   error: string,
+  projectId: string,
+  referenceFiles: ReferenceFile[],
   startIndex = 0
 ): ImageGeneration[] {
   return Array.from({ length: count }, (_value, index) => (
-    buildGeneration(prompt, provider, "", "failed", error, model, size, batchId, startIndex + index + 1, summaryPath)
+    buildGeneration(prompt, provider, "", "failed", error, model, size, batchId, startIndex + index + 1, summaryPath, projectId, referenceFiles)
   ));
 }
 
@@ -638,6 +724,33 @@ function registerIpcHandlers(): void {
     applyAutoUpdateSetting(saved.autoUpdate);
     return saved;
   });
+  ipcMain.handle("project:create", (_event, name: string) => store.createProject(name));
+  ipcMain.handle("project:update", (_event, project: PixelForgeProject) => store.updateProject(project));
+  ipcMain.handle("project:delete", (_event, projectId: string) => store.deleteProject(projectId));
+  ipcMain.handle("project:setActive", (_event, projectId: string) => store.setActiveProject(projectId));
+  ipcMain.handle("project:addReferenceFiles", async (event, projectId: string) => {
+    const options: Electron.OpenDialogOptions = {
+      title: "Add reference images",
+      properties: ["openFile", "multiSelections"],
+      filters: [
+        { name: "Images", extensions: ["png", "jpg", "jpeg", "webp"] }
+      ]
+    };
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const result = window
+      ? await dialog.showOpenDialog(window, options)
+      : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths.length) {
+      const state = await store.load();
+      const project = state.projects.find((candidate) => candidate.id === projectId);
+      if (!project) throw new Error("Project not found.");
+      return project;
+    }
+    const supportedFiles = result.filePaths.filter(isSupportedReferenceImage);
+    return store.addReferenceFiles(projectId, supportedFiles);
+  });
+  ipcMain.handle("project:removeReferenceFile", (_event, projectId: string, referenceId: string) =>
+    store.removeReferenceFile(projectId, referenceId));
   ipcMain.handle("secret:saveOpenAiApiKey", (_event, apiKey: string) => store.saveOpenAiApiKey(apiKey));
   ipcMain.handle("secret:clearOpenAiApiKey", () => store.clearOpenAiApiKey());
   ipcMain.handle("secret:status", () => store.getSecretStatus());
@@ -658,13 +771,16 @@ function registerIpcHandlers(): void {
     const prompt = request.prompt.trim();
     if (!prompt) throw new Error("Add a prompt before generating images.");
     const settings = await store.updateSettings(request.settings);
-    await mkdir(settings.outputRoot, { recursive: true });
+    const state = await store.setActiveProject(request.projectId);
+    const project = state.projects.find((candidate) => candidate.id === request.projectId);
+    if (!project) throw new Error("Project not found.");
+    await mkdir(project.outputDir, { recursive: true });
     const emitLog = (message: string, stream: "info" | "stdout" | "stderr" | "error" = "info") =>
       emitGenerationLog(event.sender, message, stream);
 
     const generations = settings.provider === "openai"
-      ? await runOpenAiGeneration(prompt, settings, emitLog)
-      : await runCodexGeneration(prompt, settings, emitLog);
+      ? await runOpenAiGeneration(prompt, settings, project, project.referenceFiles, emitLog)
+      : await runCodexGeneration(prompt, settings, project, project.referenceFiles, emitLog);
     const allGenerations = await store.addGenerations(generations);
     const completed = generations.filter((generation) => generation.status === "completed").length;
     event.sender.send("generation:update", {
@@ -678,9 +794,12 @@ function registerIpcHandlers(): void {
     const state = await store.load();
     const generation = state.generations.find((candidate) => candidate.id === generationId);
     if (generation?.outputPath) {
-      const outputRoot = path.resolve(state.settings.outputRoot);
+      const project = state.projects.find((candidate) => candidate.id === generation.projectId);
+      const allowedRoots = [state.settings.outputRoot, project?.outputDir]
+        .filter((candidate): candidate is string => Boolean(candidate))
+        .map((candidate) => path.resolve(candidate));
       const outputPath = path.resolve(generation.outputPath);
-      if (outputPath.startsWith(outputRoot + path.sep)) {
+      if (allowedRoots.some((root) => outputPath.startsWith(root + path.sep))) {
         await rm(outputPath, { force: true });
       }
     }

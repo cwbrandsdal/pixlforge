@@ -7,11 +7,13 @@ import {
   Cloud,
   Copy,
   ExternalLink,
+  FileImage,
   FolderOpen,
   Image as ImageIcon,
   Images,
   KeyRound,
   LoaderCircle,
+  Plus,
   RefreshCw,
   Save,
   Settings,
@@ -19,10 +21,11 @@ import {
   Sparkles,
   Terminal,
   Trash2,
+  Upload,
   Wand2,
   X
 } from "lucide-react";
-import type { ImageGeneration, PixelForgeSettings, SecretStatus, UpdateState } from "../shared/types";
+import type { ImageGeneration, PixelForgeProject, PixelForgeSettings, ReferenceFile, SecretStatus, UpdateState } from "../shared/types";
 import "./styles.css";
 
 type LogEntry = {
@@ -93,6 +96,8 @@ const logoUrl = new URL("../../assets/icon.png", import.meta.url).href;
 
 function App() {
   const [settings, setSettings] = useState<PixelForgeSettings>(emptySettings);
+  const [projects, setProjects] = useState<PixelForgeProject[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState("");
   const [generations, setGenerations] = useState<ImageGeneration[]>([]);
   const [assetUrls, setAssetUrls] = useState<Record<string, string>>({});
   const [secretStatus, setSecretStatus] = useState<SecretStatus>(emptySecretStatus);
@@ -104,14 +109,25 @@ function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [preview, setPreview] = useState<ImageGeneration | null>(null);
   const [activeView, setActiveView] = useState<AppView>("forge");
+  const [newProjectName, setNewProjectName] = useState("");
 
+  const selectedProject = useMemo(
+    () => projects.find((project) => project.id === activeProjectId) ?? projects[0] ?? null,
+    [projects, activeProjectId]
+  );
+  const projectGenerations = useMemo(
+    () => selectedProject
+      ? generations.filter((generation) => generation.projectId === selectedProject.id)
+      : [],
+    [generations, selectedProject]
+  );
   const completedGenerations = useMemo(
-    () => generations.filter((generation) => generation.status === "completed" && generation.outputPath),
-    [generations]
+    () => projectGenerations.filter((generation) => generation.status === "completed" && generation.outputPath),
+    [projectGenerations]
   );
   const failedGenerations = useMemo(
-    () => generations.filter((generation) => generation.status === "failed"),
-    [generations]
+    () => projectGenerations.filter((generation) => generation.status === "failed"),
+    [projectGenerations]
   );
 
   useEffect(() => {
@@ -122,6 +138,8 @@ function App() {
 
     void window.pixelforge.loadState().then((state) => {
       setSettings(state.settings);
+      setProjects(state.projects);
+      setActiveProjectId(state.activeProjectId);
       setGenerations(state.generations);
       return Promise.all([
         window.pixelforge.getSecretStatus(),
@@ -150,7 +168,10 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const paths = completedGenerations.map((generation) => generation.outputPath);
+    const paths = [
+      ...completedGenerations.map((generation) => generation.outputPath),
+      ...(selectedProject?.referenceFiles.map((reference) => reference.path) ?? [])
+    ];
     if (!paths.length) {
       setAssetUrls({});
       return;
@@ -169,7 +190,7 @@ function App() {
     return () => {
       canceled = true;
     };
-  }, [completedGenerations]);
+  }, [completedGenerations, selectedProject?.referenceFiles]);
 
   async function updateSettings(patch: Partial<PixelForgeSettings>) {
     const next = { ...settings, ...patch };
@@ -187,6 +208,73 @@ function App() {
     const outputRoot = await window.pixelforge.chooseOutputRoot();
     if (outputRoot) {
       await updateSettings({ outputRoot });
+    }
+  }
+
+  function applyState(state: { settings: PixelForgeSettings; projects: PixelForgeProject[]; activeProjectId: string; generations: ImageGeneration[] }) {
+    setSettings(state.settings);
+    setProjects(state.projects);
+    setActiveProjectId(state.activeProjectId);
+    setGenerations(state.generations);
+  }
+
+  async function selectProject(projectId: string) {
+    setActiveProjectId(projectId);
+    try {
+      const state = await window.pixelforge.setActiveProject(projectId);
+      applyState(state);
+      setStatus(`Project: ${state.projects.find((project) => project.id === state.activeProjectId)?.name ?? "Selected"}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not switch project");
+    }
+  }
+
+  async function createProject() {
+    const name = newProjectName.trim();
+    if (!name) {
+      setStatus("Add a project name first");
+      return;
+    }
+    try {
+      const state = await window.pixelforge.createProject(name);
+      applyState(state);
+      setNewProjectName("");
+      setStatus(`Created ${name}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not create project");
+    }
+  }
+
+  async function deleteSelectedProject() {
+    if (!selectedProject || projects.length <= 1) return;
+    try {
+      const state = await window.pixelforge.deleteProject(selectedProject.id);
+      applyState(state);
+      setStatus("Project deleted");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not delete project");
+    }
+  }
+
+  async function addReferenceFiles() {
+    if (!selectedProject) return;
+    try {
+      const updated = await window.pixelforge.addProjectReferenceFiles(selectedProject.id);
+      setProjects((current) => current.map((project) => project.id === updated.id ? updated : project));
+      setStatus("Reference images updated");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not add reference images");
+    }
+  }
+
+  async function removeReferenceFile(reference: ReferenceFile) {
+    if (!selectedProject) return;
+    try {
+      const updated = await window.pixelforge.removeProjectReferenceFile(selectedProject.id, reference.id);
+      setProjects((current) => current.map((project) => project.id === updated.id ? updated : project));
+      setStatus("Reference image removed");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not remove reference image");
     }
   }
 
@@ -218,7 +306,10 @@ function App() {
     setLogs([]);
     setStatus("Generating");
     try {
-      await window.pixelforge.generateImages({ prompt, settings });
+      if (!selectedProject) {
+        throw new Error("Create or select a project before generating images.");
+      }
+      await window.pixelforge.generateImages({ projectId: selectedProject.id, prompt, settings });
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Generation failed");
     } finally {
@@ -323,6 +414,49 @@ function App() {
       ) : (
       <section className="workspace">
         <aside className="control-panel">
+          <div className="panel-section project-section">
+            <div className="section-title">
+              <FolderOpen size={18} />
+              <h2>Project</h2>
+            </div>
+            <label>
+              Active project
+              <select value={selectedProject?.id ?? ""} onChange={(event) => void selectProject(event.target.value)}>
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>{project.name}</option>
+                ))}
+              </select>
+            </label>
+            <div className="project-create-row">
+              <input
+                value={newProjectName}
+                placeholder="New project name"
+                onChange={(event) => setNewProjectName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void createProject();
+                }}
+              />
+              <button type="button" className="icon-button" title="Create project" onClick={() => void createProject()}>
+                <Plus size={16} />
+              </button>
+              <button
+                type="button"
+                className="icon-button"
+                title="Delete project"
+                disabled={projects.length <= 1}
+                onClick={() => void deleteSelectedProject()}
+              >
+                <Trash2 size={16} />
+              </button>
+            </div>
+            {selectedProject && (
+              <button type="button" className="path-button" onClick={() => void window.pixelforge.showItemInFolder(selectedProject.outputDir)}>
+                <span>{selectedProject.outputDir}</span>
+                <FolderOpen size={16} />
+              </button>
+            )}
+          </div>
+
           <div className="panel-section prompt-section">
             <div className="section-title">
               <Wand2 size={18} />
@@ -374,7 +508,36 @@ function App() {
             </div>
           </div>
 
-          <button className="generate-button" type="button" disabled={isGenerating} onClick={() => void generateImages()}>
+          <div className="panel-section reference-section">
+            <div className="section-title">
+              <FileImage size={18} />
+              <h2>References</h2>
+            </div>
+            <button type="button" className="upload-button" disabled={!selectedProject} onClick={() => void addReferenceFiles()}>
+              <Upload size={17} />
+              Upload images
+            </button>
+            <div className="reference-list">
+              {selectedProject?.referenceFiles.length ? selectedProject.referenceFiles.map((reference) => (
+                <div className="reference-item" key={reference.id}>
+                  <div className="reference-thumb">
+                    {assetUrls[reference.path] ? <img src={assetUrls[reference.path]} alt="" /> : <FileImage size={18} />}
+                  </div>
+                  <div>
+                    <strong>{reference.name}</strong>
+                    <span>{formatBytes(reference.size)}</span>
+                  </div>
+                  <button type="button" title="Remove reference" onClick={() => void removeReferenceFile(reference)}>
+                    <X size={14} />
+                  </button>
+                </div>
+              )) : (
+                <p className="empty-reference">No reference images attached.</p>
+              )}
+            </div>
+          </div>
+
+          <button className="generate-button" type="button" disabled={isGenerating || !selectedProject} onClick={() => void generateImages()}>
             {isGenerating ? <LoaderCircle size={20} className="spin" /> : <Sparkles size={20} />}
             Generate
           </button>
@@ -685,6 +848,18 @@ function formatTime(value: string): string {
     second: "2-digit",
     hour12: false
   }).format(date);
+}
+
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let amount = value;
+  let unitIndex = 0;
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024;
+    unitIndex++;
+  }
+  return `${unitIndex === 0 ? Math.round(amount) : amount.toFixed(amount >= 10 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
 createRoot(document.getElementById("root")!).render(

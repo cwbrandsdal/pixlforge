@@ -4,10 +4,13 @@
 
 PixelForge is a Windows desktop app for generating image batches from a prompt.
 
+Projects keep separate output folders, generated images, and reference images for workflows like marketing, product art, brand kits, or client work.
+
 Generation backends:
 
 - Codex CLI with `$imagegen`, using the same generated-image collection pattern as Creator.
 - OpenAI Images API with a locally saved API key.
+- Project reference images such as logos, screenshots, or product photos can be attached to the prompt.
 
 Secrets are never stored in this repository. The OpenAI API key is stored in the app's per-user Electron data folder using `safeStorage` when available, or can be supplied at runtime with `OPENAI_API_KEY`.
 
