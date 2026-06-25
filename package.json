@@ -1,7 +1,7 @@
 {
   "name": "pixelforge",
   "productName": "PixelForge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Desktop prompt-to-image batch generator powered by Codex CLI and the OpenAI Images API.",
   "main": "dist-electron/main.js",
   "type": "module",
@@ -21,7 +21,8 @@
   "author": "Christopher Brandsdal",
   "license": "MIT",
   "dependencies": {
-    "electron-updater": "^6.8.9"
+    "electron-updater": "^6.8.9",
+    "sharp": "^0.35.2"
   },
   "devDependencies": {
     "@types/node": "^24.10.2",
@@ -44,6 +45,10 @@
     "directories": {
       "output": "dist"
     },
+    "asarUnpack": [
+      "node_modules/sharp/**/*",
+      "node_modules/@img/**/*"
+    ],
     "files": [
       "dist-electron/**/*",
       "dist-renderer/**/*",

@@ -636,7 +636,7 @@ label {
 
 .metrics-row {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
   padding: 14px;
   border-bottom: 1px solid var(--line);
@@ -664,6 +664,66 @@ label {
   font-size: 18px;
 }
 
+.gallery-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 64px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: #15191b;
+}
+
+.gallery-toolbar strong,
+.gallery-toolbar span {
+  display: block;
+}
+
+.gallery-toolbar strong {
+  font-size: 13px;
+}
+
+.gallery-toolbar span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.gallery-toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.gallery-toolbar-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #22282c;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.gallery-toolbar-actions button:disabled,
+.card-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.gallery-toolbar-actions .upscale-action {
+  border-color: color-mix(in srgb, var(--lime), transparent 38%);
+  background: rgba(183, 227, 44, 0.12);
+  color: var(--lime);
+}
+
 .gallery {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
@@ -681,6 +741,14 @@ label {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #1b2023;
+}
+
+.image-card.final-card {
+  border-color: color-mix(in srgb, var(--lime), transparent 55%);
+}
+
+.image-preview-wrap {
+  position: relative;
 }
 
 .image-preview {
@@ -701,6 +769,52 @@ label {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+.select-toggle {
+  position: absolute;
+  z-index: 2;
+  top: 8px;
+  left: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid rgba(247, 243, 236, 0.24);
+  border-radius: 8px;
+  background: rgba(10, 14, 16, 0.76);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.select-toggle.active {
+  border-color: color-mix(in srgb, var(--lime), transparent 28%);
+  background: rgba(183, 227, 44, 0.2);
+  color: var(--lime);
+}
+
+.image-badge {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+  padding: 5px 8px;
+  border: 1px solid rgba(247, 243, 236, 0.18);
+  border-radius: 7px;
+  background: rgba(10, 14, 16, 0.78);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 850;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-badge.final {
+  border-color: color-mix(in srgb, var(--lime), transparent 38%);
+  color: var(--lime);
 }
 
 .image-meta {
@@ -743,6 +857,11 @@ label {
   background: #22282c;
   color: var(--text);
   cursor: pointer;
+}
+
+.card-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
 }
 
 .empty-gallery,
@@ -893,6 +1012,19 @@ label {
 
   .topbar-left {
     gap: 14px;
+  }
+
+  .metrics-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .gallery-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .gallery-toolbar-actions {
+    justify-content: flex-start;
   }
 
   .settings-grid-page,

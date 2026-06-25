@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { GenerateImagesRequest, PixelForgeProject, PixelForgeSettings } from "./types";
+import type { GenerateImagesRequest, PixelForgeProject, PixelForgeSettings, UpscaleImagesRequest } from "./types";
 
 const api = {
   loadState: () => ipcRenderer.invoke("state:load"),
@@ -13,6 +13,7 @@ const api = {
     ipcRenderer.invoke("project:removeReferenceFile", projectId, referenceId),
   chooseOutputRoot: () => ipcRenderer.invoke("output:chooseRoot"),
   generateImages: (request: GenerateImagesRequest) => ipcRenderer.invoke("generation:run", request),
+  upscaleImages: (request: UpscaleImagesRequest) => ipcRenderer.invoke("generation:upscale", request),
   deleteGeneration: (generationId: string) => ipcRenderer.invoke("generation:delete", generationId),
   getAssetUrl: (filePath: string) => ipcRenderer.invoke("asset:url", filePath),
   openPath: (filePath: string) => ipcRenderer.invoke("shell:openPath", filePath),

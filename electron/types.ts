@@ -1,6 +1,10 @@
 export type ImageProvider = "codex" | "openai";
 
+export type GenerationProvider = ImageProvider | "local";
+
 export type GenerationStatus = "completed" | "failed";
+
+export type GenerationKind = "draft" | "final";
 
 export type CodexReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
@@ -45,7 +49,9 @@ export interface ImageGeneration {
   id: string;
   projectId: string;
   prompt: string;
-  provider: ImageProvider;
+  provider: GenerationProvider;
+  kind: GenerationKind;
+  parentGenerationId: string;
   outputPath: string;
   status: GenerationStatus;
   error: string;
@@ -72,6 +78,15 @@ export interface GenerateImagesRequest {
 }
 
 export interface GenerateImagesResult {
+  generations: ImageGeneration[];
+}
+
+export interface UpscaleImagesRequest {
+  projectId: string;
+  generationIds: string[];
+}
+
+export interface UpscaleImagesResult {
   generations: ImageGeneration[];
 }
 

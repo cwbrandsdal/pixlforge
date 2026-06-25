@@ -6,6 +6,8 @@ import type {
   PixelForgeSettings,
   PixelForgeState,
   SecretStatus,
+  UpscaleImagesRequest,
+  UpscaleImagesResult,
   UpdateState
 } from "../shared/types";
 
@@ -24,6 +26,7 @@ declare global {
       removeProjectReferenceFile: (projectId: string, referenceId: string) => Promise<PixelForgeProject>;
       chooseOutputRoot: () => Promise<string | null>;
       generateImages: (request: GenerateImagesRequest) => Promise<GenerateImagesResult>;
+      upscaleImages: (request: UpscaleImagesRequest) => Promise<UpscaleImagesResult>;
       deleteGeneration: (generationId: string) => Promise<string>;
       getAssetUrl: (filePath: string) => Promise<string>;
       openPath: (filePath: string) => Promise<void>;

@@ -7,14 +7,19 @@ import { createServer, type Server } from "node:http";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import sharp from "sharp";
 import { PixelForgeStore } from "./store.js";
 import type {
   GenerateImagesRequest,
   GenerateImagesResult,
+  GenerationKind,
+  GenerationProvider,
   ImageGeneration,
   PixelForgeProject,
   PixelForgeSettings,
   ReferenceFile,
+  UpscaleImagesRequest,
+  UpscaleImagesResult,
   UpdateState
 } from "./types.js";
 
@@ -617,9 +622,143 @@ async function downloadImage(url: string): Promise<Buffer> {
   return Buffer.from(await response.arrayBuffer());
 }
 
+async function runLocalUpscale(
+  sourceGenerations: ImageGeneration[],
+  project: PixelForgeProject,
+  emitLog: (message: string, stream?: "info" | "stdout" | "stderr" | "error") => void
+): Promise<ImageGeneration[]> {
+  const candidates = sourceGenerations.filter((generation) =>
+    generation.status === "completed" &&
+    generation.outputPath &&
+    existsSync(generation.outputPath) &&
+    isImagePath(generation.outputPath)
+  );
+  if (!candidates.length) {
+    throw new Error("Select at least one completed image to upscale.");
+  }
+
+  const createdAt = new Date().toISOString();
+  const batchId = randomUUID();
+  const batchStamp = createdAt.replace(/[:.]/g, "-");
+  const outputDir = path.join(project.outputDir, "generations", "upscaled", batchStamp);
+  const summaryPath = path.join(outputDir, "upscale-summary.json");
+  await mkdir(outputDir, { recursive: true });
+
+  emitLog(`Starting local 4K upscale for ${candidates.length} image${candidates.length === 1 ? "" : "s"}.`);
+  emitLog(`Project: ${project.name}`);
+  emitLog(`Output: ${outputDir}`);
+
+  const results: ImageGeneration[] = [];
+  const summary: Array<Record<string, unknown>> = [];
+  for (let index = 0; index < candidates.length; index++) {
+    const source = candidates[index];
+    try {
+      const metadata = await sharp(source.outputPath).metadata();
+      const width = metadata.width ?? 0;
+      const height = metadata.height ?? 0;
+      if (!width || !height) {
+        throw new Error("Could not read source image dimensions.");
+      }
+
+      const target = get4kTargetDimensions(width, height);
+      const fileName = `${sanitizeFileName(path.basename(source.outputPath, path.extname(source.outputPath)))}-4k.png`;
+      const outputPath = path.join(outputDir, uniqueFileName(fileName, index + 1));
+
+      await sharp(source.outputPath)
+        .rotate()
+        .resize({
+          width: target.width,
+          height: target.height,
+          fit: "fill",
+          kernel: sharp.kernel.lanczos3,
+          withoutEnlargement: false
+        })
+        .png({ compressionLevel: 9, adaptiveFiltering: true })
+        .toFile(outputPath);
+
+      emitLog(`Upscaled ${index + 1}/${candidates.length}: ${target.width}x${target.height} ${outputPath}`);
+      summary.push({
+        sourceId: source.id,
+        sourcePath: source.outputPath,
+        outputPath,
+        sourceSize: `${width}x${height}`,
+        outputSize: `${target.width}x${target.height}`
+      });
+      results.push(buildGeneration(
+        source.prompt,
+        "local",
+        outputPath,
+        "completed",
+        "",
+        "PixelForge local upscaler",
+        `${target.width}x${target.height}`,
+        batchId,
+        index + 1,
+        summaryPath,
+        project.id,
+        [],
+        "final",
+        source.id
+      ));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      emitLog(`Upscale failed for ${source.outputPath}: ${message}`, "error");
+      summary.push({
+        sourceId: source.id,
+        sourcePath: source.outputPath,
+        error: message
+      });
+      results.push(buildGeneration(
+        source.prompt,
+        "local",
+        "",
+        "failed",
+        message,
+        "PixelForge local upscaler",
+        "4K",
+        batchId,
+        index + 1,
+        summaryPath,
+        project.id,
+        [],
+        "final",
+        source.id
+      ));
+    }
+  }
+
+  await writeFile(summaryPath, JSON.stringify({
+    createdAt,
+    projectId: project.id,
+    target: "4K",
+    images: summary
+  }, null, 2), "utf8");
+
+  return results;
+}
+
+function get4kTargetDimensions(width: number, height: number): { width: number; height: number } {
+  const targetLongEdge = width === height ? 4096 : 3840;
+  const scale = Math.max(1, targetLongEdge / Math.max(width, height));
+  return {
+    width: makeEven(Math.round(width * scale)),
+    height: makeEven(Math.round(height * scale))
+  };
+}
+
+function makeEven(value: number): number {
+  return Math.max(2, value % 2 === 0 ? value : value + 1);
+}
+
+function uniqueFileName(fileName: string, index: number): string {
+  const extension = path.extname(fileName);
+  const baseName = path.basename(fileName, extension);
+  return `${baseName}-${index}${extension}`;
+}
+
 function buildGeneration(
   prompt: string,
-  provider: "codex" | "openai",
+  provider: GenerationProvider,
   outputPath: string,
   status: "completed" | "failed",
   error: string,
@@ -629,13 +768,17 @@ function buildGeneration(
   index: number,
   summaryPath: string,
   projectId: string,
-  referenceFiles: ReferenceFile[]
+  referenceFiles: ReferenceFile[],
+  kind: GenerationKind = "draft",
+  parentGenerationId = ""
 ): ImageGeneration {
   return {
     id: randomUUID(),
     projectId,
     prompt,
     provider,
+    kind,
+    parentGenerationId,
     outputPath,
     status,
     error,
@@ -651,7 +794,7 @@ function buildGeneration(
 
 function buildFailedResults(
   prompt: string,
-  provider: "codex" | "openai",
+  provider: GenerationProvider,
   count: number,
   model: string,
   size: string,
@@ -660,10 +803,12 @@ function buildFailedResults(
   error: string,
   projectId: string,
   referenceFiles: ReferenceFile[],
-  startIndex = 0
+  startIndex = 0,
+  kind: GenerationKind = "draft",
+  parentGenerationId = ""
 ): ImageGeneration[] {
   return Array.from({ length: count }, (_value, index) => (
-    buildGeneration(prompt, provider, "", "failed", error, model, size, batchId, startIndex + index + 1, summaryPath, projectId, referenceFiles)
+    buildGeneration(prompt, provider, "", "failed", error, model, size, batchId, startIndex + index + 1, summaryPath, projectId, referenceFiles, kind, parentGenerationId)
   ));
 }
 
@@ -785,7 +930,30 @@ function registerIpcHandlers(): void {
     const completed = generations.filter((generation) => generation.status === "completed").length;
     event.sender.send("generation:update", {
       generations: allGenerations,
-      message: `Generated ${completed}/${generations.length} image${generations.length === 1 ? "" : "s"}.`
+      message: `Created ${completed}/${generations.length} draft${generations.length === 1 ? "" : "s"}.`
+    });
+    return { generations };
+  });
+
+  ipcMain.handle("generation:upscale", async (event, request: UpscaleImagesRequest): Promise<UpscaleImagesResult> => {
+    const state = await store.setActiveProject(request.projectId);
+    const project = state.projects.find((candidate) => candidate.id === request.projectId);
+    if (!project) throw new Error("Project not found.");
+    const selectedIds = new Set(request.generationIds);
+    const sourceGenerations = state.generations.filter((generation) =>
+      selectedIds.has(generation.id) &&
+      generation.projectId === request.projectId &&
+      generation.kind !== "final"
+    );
+    const emitLog = (message: string, stream: "info" | "stdout" | "stderr" | "error" = "info") =>
+      emitGenerationLog(event.sender, message, stream);
+
+    const generations = await runLocalUpscale(sourceGenerations, project, emitLog);
+    const allGenerations = await store.addGenerations(generations);
+    const completed = generations.filter((generation) => generation.status === "completed").length;
+    event.sender.send("generation:update", {
+      generations: allGenerations,
+      message: `Created ${completed}/${generations.length} 4K final${generations.length === 1 ? "" : "s"}.`
     });
     return { generations };
   });

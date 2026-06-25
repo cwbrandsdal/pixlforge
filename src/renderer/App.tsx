@@ -13,12 +13,15 @@ import {
   Images,
   KeyRound,
   LoaderCircle,
+  Maximize2,
   Plus,
   RefreshCw,
   Save,
   Settings,
   ShieldCheck,
   Sparkles,
+  Square,
+  SquareCheck,
   Terminal,
   Trash2,
   Upload,
@@ -110,6 +113,8 @@ function App() {
   const [preview, setPreview] = useState<ImageGeneration | null>(null);
   const [activeView, setActiveView] = useState<AppView>("forge");
   const [newProjectName, setNewProjectName] = useState("");
+  const [selectedGenerationIds, setSelectedGenerationIds] = useState<string[]>([]);
+  const [isUpscaling, setIsUpscaling] = useState(false);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === activeProjectId) ?? projects[0] ?? null,
@@ -124,6 +129,18 @@ function App() {
   const completedGenerations = useMemo(
     () => projectGenerations.filter((generation) => generation.status === "completed" && generation.outputPath),
     [projectGenerations]
+  );
+  const draftGenerations = useMemo(
+    () => completedGenerations.filter((generation) => generation.kind !== "final"),
+    [completedGenerations]
+  );
+  const finalGenerations = useMemo(
+    () => completedGenerations.filter((generation) => generation.kind === "final"),
+    [completedGenerations]
+  );
+  const selectedDraftGenerations = useMemo(
+    () => draftGenerations.filter((generation) => selectedGenerationIds.includes(generation.id)),
+    [draftGenerations, selectedGenerationIds]
   );
   const failedGenerations = useMemo(
     () => projectGenerations.filter((generation) => generation.status === "failed"),
@@ -191,6 +208,11 @@ function App() {
       canceled = true;
     };
   }, [completedGenerations, selectedProject?.referenceFiles]);
+
+  useEffect(() => {
+    const draftIds = new Set(draftGenerations.map((generation) => generation.id));
+    setSelectedGenerationIds((current) => current.filter((id) => draftIds.has(id)));
+  }, [draftGenerations]);
 
   async function updateSettings(patch: Partial<PixelForgeSettings>) {
     const next = { ...settings, ...patch };
@@ -297,14 +319,14 @@ function App() {
   }
 
   async function generateImages() {
-    if (isGenerating) return;
+    if (isGenerating || isUpscaling) return;
     if (!prompt.trim()) {
       setStatus("Add a prompt before generating images");
       return;
     }
     setIsGenerating(true);
     setLogs([]);
-    setStatus("Generating");
+    setStatus("Creating drafts");
     try {
       if (!selectedProject) {
         throw new Error("Create or select a project before generating images.");
@@ -320,6 +342,7 @@ function App() {
   async function deleteGeneration(generation: ImageGeneration) {
     await window.pixelforge.deleteGeneration(generation.id);
     setGenerations((current) => current.filter((candidate) => candidate.id !== generation.id));
+    setSelectedGenerationIds((current) => current.filter((id) => id !== generation.id));
     if (preview?.id === generation.id) setPreview(null);
     setStatus("Image deleted");
   }
@@ -327,6 +350,38 @@ function App() {
   async function copyImage(generation: ImageGeneration) {
     const copied = await window.pixelforge.copyImage(generation.outputPath);
     setStatus(copied ? "Image copied" : "Image could not be copied");
+  }
+
+  function toggleDraftSelection(generationId: string) {
+    setSelectedGenerationIds((current) => current.includes(generationId)
+      ? current.filter((id) => id !== generationId)
+      : [...current, generationId]);
+  }
+
+  function selectAllDrafts() {
+    setSelectedGenerationIds(draftGenerations.map((generation) => generation.id));
+  }
+
+  async function upscaleDrafts(generationIds: string[]) {
+    if (!selectedProject || isGenerating || isUpscaling) return;
+    const draftIds = new Set(draftGenerations.map((generation) => generation.id));
+    const ids = generationIds.filter((id) => draftIds.has(id));
+    if (!ids.length) {
+      setStatus("Select one or more drafts first");
+      return;
+    }
+
+    setIsUpscaling(true);
+    setLogs([]);
+    setStatus("Creating 4K finals");
+    try {
+      await window.pixelforge.upscaleImages({ projectId: selectedProject.id, generationIds: ids });
+      setSelectedGenerationIds((current) => current.filter((id) => !ids.includes(id)));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Upscale failed");
+    } finally {
+      setIsUpscaling(false);
+    }
   }
 
   function updateStatusText() {
@@ -537,42 +592,96 @@ function App() {
             </div>
           </div>
 
-          <button className="generate-button" type="button" disabled={isGenerating || !selectedProject} onClick={() => void generateImages()}>
+          <button className="generate-button" type="button" disabled={isGenerating || isUpscaling || !selectedProject} onClick={() => void generateImages()}>
             {isGenerating ? <LoaderCircle size={20} className="spin" /> : <Sparkles size={20} />}
-            Generate
+            Create Drafts
           </button>
         </aside>
 
         <section className="results-panel">
           <div className="metrics-row">
-            <Metric icon={<Images size={19} />} label="Saved" value={String(completedGenerations.length)} />
+            <Metric icon={<Images size={19} />} label="Drafts" value={String(draftGenerations.length)} />
+            <Metric icon={<Maximize2 size={19} />} label="4K Finals" value={String(finalGenerations.length)} />
             <Metric icon={<AlertTriangle size={19} />} label="Failed" value={String(failedGenerations.length)} />
             <Metric icon={<KeyRound size={19} />} label="Key" value={secretStatus.openAiApiKeySaved || secretStatus.openAiApiKeyFromEnv ? "Ready" : "Missing"} />
           </div>
 
+          <div className="gallery-toolbar">
+            <div>
+              <strong>{selectedDraftGenerations.length} selected</strong>
+              <span>Upscale selected drafts into project-level 4K finals.</span>
+            </div>
+            <div className="gallery-toolbar-actions">
+              <button type="button" disabled={!draftGenerations.length} onClick={selectAllDrafts}>
+                <SquareCheck size={15} />
+                Select drafts
+              </button>
+              <button type="button" disabled={!selectedGenerationIds.length} onClick={() => setSelectedGenerationIds([])}>
+                <Square size={15} />
+                Clear
+              </button>
+              <button
+                type="button"
+                className="upscale-action"
+                disabled={!selectedDraftGenerations.length || isGenerating || isUpscaling}
+                onClick={() => void upscaleDrafts(selectedDraftGenerations.map((generation) => generation.id))}
+              >
+                {isUpscaling ? <LoaderCircle size={16} className="spin" /> : <Maximize2 size={16} />}
+                4K Upscale
+              </button>
+            </div>
+          </div>
+
           <div className="gallery">
-            {completedGenerations.length ? completedGenerations.map((generation) => (
-              <article className="image-card" key={generation.id}>
-                <button type="button" className="image-preview" onClick={() => setPreview(generation)}>
-                  {assetUrls[generation.outputPath] ? (
-                    <img src={assetUrls[generation.outputPath]} alt="" />
-                  ) : (
-                    <ImageIcon size={28} />
-                  )}
-                </button>
-                <div className="image-meta">
-                  <strong>{generation.provider === "codex" ? "Codex" : "OpenAI"} #{generation.index}</strong>
-                  <span>{formatDate(generation.createdAt)}</span>
-                </div>
-                <p>{generation.prompt}</p>
-                <div className="card-actions">
-                  <button type="button" title="Copy image" onClick={() => void copyImage(generation)}><Copy size={15} /></button>
-                  <button type="button" title="Show in folder" onClick={() => void window.pixelforge.showItemInFolder(generation.outputPath)}><FolderOpen size={15} /></button>
-                  <button type="button" title="Open file" onClick={() => void window.pixelforge.openPath(generation.outputPath)}><ExternalLink size={15} /></button>
-                  <button type="button" title="Delete image" onClick={() => void deleteGeneration(generation)}><Trash2 size={15} /></button>
-                </div>
-              </article>
-            )) : (
+            {completedGenerations.length ? completedGenerations.map((generation) => {
+              const isFinal = generation.kind === "final";
+              const isSelected = selectedGenerationIds.includes(generation.id);
+              return (
+                <article className={`image-card ${isFinal ? "final-card" : ""}`} key={generation.id}>
+                  <div className="image-preview-wrap">
+                    {!isFinal && (
+                      <button
+                        type="button"
+                        className={`select-toggle ${isSelected ? "active" : ""}`}
+                        title={isSelected ? "Deselect draft" : "Select draft"}
+                        onClick={() => toggleDraftSelection(generation.id)}
+                      >
+                        {isSelected ? <SquareCheck size={17} /> : <Square size={17} />}
+                      </button>
+                    )}
+                    <button type="button" className="image-preview" onClick={() => setPreview(generation)}>
+                      {assetUrls[generation.outputPath] ? (
+                        <img src={assetUrls[generation.outputPath]} alt="" />
+                      ) : (
+                        <ImageIcon size={28} />
+                      )}
+                    </button>
+                    <span className={`image-badge ${isFinal ? "final" : "draft"}`}>{isFinal ? "4K Final" : "Draft"}</span>
+                  </div>
+                  <div className="image-meta">
+                    <strong>{generationTitle(generation)}</strong>
+                    <span>{formatDate(generation.createdAt)}</span>
+                  </div>
+                  <p>{generation.prompt}</p>
+                  <div className="card-actions">
+                    {!isFinal && (
+                      <button
+                        type="button"
+                        title="Upscale this draft to 4K"
+                        disabled={isGenerating || isUpscaling}
+                        onClick={() => void upscaleDrafts([generation.id])}
+                      >
+                        <Maximize2 size={15} />
+                      </button>
+                    )}
+                    <button type="button" title="Copy image" onClick={() => void copyImage(generation)}><Copy size={15} /></button>
+                    <button type="button" title="Show in folder" onClick={() => void window.pixelforge.showItemInFolder(generation.outputPath)}><FolderOpen size={15} /></button>
+                    <button type="button" title="Open file" onClick={() => void window.pixelforge.openPath(generation.outputPath)}><ExternalLink size={15} /></button>
+                    <button type="button" title="Delete image" onClick={() => void deleteGeneration(generation)}><Trash2 size={15} /></button>
+                  </div>
+                </article>
+              );
+            }) : (
               <div className="empty-gallery">
                 <ImageIcon size={42} />
                 <strong>No images yet</strong>
@@ -613,7 +722,7 @@ function App() {
             {assetUrls[preview.outputPath] && <img src={assetUrls[preview.outputPath]} alt="" />}
             <footer>
               <div>
-                <strong>{preview.provider === "codex" ? "Codex CLI" : preview.model}</strong>
+                <strong>{generationTitle(preview)}</strong>
                 <span>{preview.outputPath}</span>
               </div>
               <div className="card-actions">
@@ -636,6 +745,13 @@ function Metric({ icon, label, value }: { icon: React.ReactNode; label: string; 
       <strong>{value}</strong>
     </div>
   );
+}
+
+function generationTitle(generation: ImageGeneration): string {
+  if (generation.kind === "final") return `4K Final #${generation.index}`;
+  if (generation.provider === "codex") return `Codex Draft #${generation.index}`;
+  if (generation.provider === "openai") return `OpenAI Draft #${generation.index}`;
+  return `PixelForge #${generation.index}`;
 }
 
 function SettingsView({
