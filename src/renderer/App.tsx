@@ -214,6 +214,17 @@ function App() {
     setSelectedGenerationIds((current) => current.filter((id) => draftIds.has(id)));
   }, [draftGenerations]);
 
+  useEffect(() => {
+    if (!preview) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setPreview(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [preview]);
+
   async function updateSettings(patch: Partial<PixelForgeSettings>) {
     const next = { ...settings, ...patch };
     setSettings(next);
@@ -716,16 +727,26 @@ function App() {
       {preview && (
         <div className="preview-modal" onClick={() => setPreview(null)}>
           <div className="preview-content" onClick={(event) => event.stopPropagation()}>
-            <button type="button" className="icon-button close-preview" onClick={() => setPreview(null)}>
-              <X size={18} />
-            </button>
-            {assetUrls[preview.outputPath] && <img src={assetUrls[preview.outputPath]} alt="" />}
+            <div className="preview-toolbar">
+              <button type="button" className="icon-button close-preview" title="Close preview" onClick={() => setPreview(null)}>
+                <X size={18} />
+              </button>
+            </div>
+            <div
+              className="preview-image-stage"
+              onClick={(event) => {
+                if (event.target === event.currentTarget) setPreview(null);
+              }}
+            >
+              {assetUrls[preview.outputPath] && <img src={assetUrls[preview.outputPath]} alt="" />}
+            </div>
             <footer>
               <div>
                 <strong>{generationTitle(preview)}</strong>
                 <span>{preview.outputPath}</span>
               </div>
               <div className="card-actions">
+                <button type="button" title="Close preview" onClick={() => setPreview(null)}><X size={15} /></button>
                 <button type="button" title="Copy image" onClick={() => void copyImage(preview)}><Copy size={15} /></button>
                 <button type="button" title="Show in folder" onClick={() => void window.pixelforge.showItemInFolder(preview.outputPath)}><FolderOpen size={15} /></button>
               </div>
