@@ -8,6 +8,17 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import sharp from "sharp";
+import {
+  canPrepareOpenAiImageReference,
+  isGeneratedImagePath,
+  isOpenAiRasterReferenceFile,
+  isPreviewableReferenceFile,
+  isSupportedReferenceFile,
+  isSvgReferenceFile,
+  isTextReferenceFile,
+  mimeTypeForReferenceFile,
+  referenceFileTypeLabel
+} from "./reference-files.js";
 import { PixelForgeStore } from "./store.js";
 import type {
   GenerateImagesRequest,
@@ -47,13 +58,12 @@ let updateState: UpdateState = {
   error: null
 };
 
-const mimeTypes: Record<string, string> = {
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".webp": "image/webp",
-  ".gif": "image/gif"
-};
+type OpenAiReferenceImage = { image_url: string };
+
+const openAiReferenceImageLimitBytes = 20 * 1024 * 1024;
+const referenceTextFileLimitBytes = 2 * 1024 * 1024;
+const referenceTextSnippetLimit = 4000;
+const referenceTextTotalLimit = 12000;
 
 async function createWindow(): Promise<void> {
   mainWindow = new BrowserWindow({
@@ -115,15 +125,14 @@ async function startAssetServer(): Promise<void> {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     const [, route, token] = url.pathname.split("/");
     const filePath = route === "asset" && token ? assetTokens.get(token) : undefined;
-    if (!filePath || !existsSync(filePath) || !isImagePath(filePath)) {
+    if (!filePath || !existsSync(filePath) || !isPreviewableReferenceFile(filePath)) {
       response.writeHead(404);
       response.end("Not found");
       return;
     }
 
-    const extension = path.extname(filePath).toLowerCase();
     response.writeHead(200, {
-      "Content-Type": mimeTypes[extension] || "application/octet-stream",
+      "Content-Type": mimeTypeForReferenceFile(filePath),
       "Content-Length": statSync(filePath).size,
       "Cache-Control": "no-store"
     });
@@ -191,14 +200,6 @@ function sanitizeFileName(value: string): string {
     .slice(0, 80) || "pixelforge";
 }
 
-function isImagePath(filePath: string): boolean {
-  return [".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(path.extname(filePath).toLowerCase());
-}
-
-function isSupportedReferenceImage(filePath: string): boolean {
-  return [".png", ".jpg", ".jpeg", ".webp"].includes(path.extname(filePath).toLowerCase());
-}
-
 function normalizeCodexReasoningEffort(value: PixelForgeSettings["codexReasoningEffort"]): PixelForgeSettings["codexReasoningEffort"] {
   return value === "medium" || value === "high" || value === "xhigh" ? value : "low";
 }
@@ -211,15 +212,15 @@ function sizeForAspectRatio(aspectRatio: PixelForgeSettings["aspectRatio"]): str
   return "1024x1024";
 }
 
-function buildCodexImagePrompt(prompt: string, settings: PixelForgeSettings, referenceFiles: ReferenceFile[]): string {
+function buildCodexImagePrompt(prompt: string, settings: PixelForgeSettings, referenceFiles: ReferenceFile[], referenceTextContext: string): string {
   const count = Math.max(1, Math.min(10, Math.floor(settings.count)));
   const variants = Array.from({ length: count }, (_value, index) => {
     const variant = index + 1;
     return `Variant ${variant}: Change composition, crop, lighting, color balance, foreground/background hierarchy, and focal emphasis while preserving the user's subject and constraints.`;
   }).join("\n");
   const references = referenceFiles.length
-    ? referenceFiles.map((file, index) => `${index + 1}. ${file.name}: attached image ${index + 1}; source path ${file.path}`).join("\n")
-    : "No reference images were attached.";
+    ? referenceFiles.map((file, index) => `${index + 1}. ${file.name} (${referenceFileTypeLabel(file)}; ${file.mimeType}; source path ${file.path})`).join("\n")
+    : "No reference files were attached.";
 
   return [
     "$imagegen",
@@ -233,11 +234,12 @@ function buildCodexImagePrompt(prompt: string, settings: PixelForgeSettings, ref
     "User prompt:",
     prompt.trim(),
     "",
-    "Reference images:",
+    "Reference files:",
     references,
     referenceFiles.length
-      ? "Use these attached reference images for logos, brand details, products, art direction, or source visual material when the prompt asks for them."
+      ? "Use attached/reference file details for logos, brand details, products, art direction, document constraints, or source material when the prompt asks for them."
       : "",
+    referenceTextContext ? "\nReference document excerpts:\n" + referenceTextContext : "",
     "",
     "Variant directions:",
     variants,
@@ -247,7 +249,7 @@ function buildCodexImagePrompt(prompt: string, settings: PixelForgeSettings, ref
     "- Make each variant meaningfully different, not a minor recolor or tiny crop change.",
     "- Avoid watermarks, UI chrome, unreadable text, and unrelated visual elements.",
     "- Generate only the requested images using the built-in image generation tool.",
-    "- Do not run shell commands, PowerShell, Python, or filesystem searches.",
+    "- Do not search the filesystem. If a non-image reference must be read, read only the listed reference file path.",
     "- Do not inspect CODEX_HOME or generated_images.",
     "- Do not copy, move, rename, inspect, or save files manually. PixelForge will collect the generated images after this run.",
     "- After all images are generated, reply with only: GENERATED"
@@ -274,6 +276,8 @@ async function runCodexGeneration(
   const summaryPath = path.join(outputDir, "codex-summary.md");
   const jobStartedAt = new Date();
   await mkdir(outputDir, { recursive: true });
+  const referenceTextContext = await buildReferenceTextContext(referenceFiles);
+  const imageReferenceFiles = await prepareCodexImageReferenceFiles(referenceFiles, outputDir, emitLog);
 
   const args = [
     "exec",
@@ -294,7 +298,7 @@ async function runCodexGeneration(
   if (settings.codexModel.trim()) {
     args.push("--model", settings.codexModel.trim());
   }
-  for (const referenceFile of referenceFiles) {
+  for (const referenceFile of imageReferenceFiles) {
     if (existsSync(referenceFile.path)) {
       args.push("--image", referenceFile.path);
     }
@@ -306,8 +310,12 @@ async function runCodexGeneration(
   emitLog(`Codex CLI: ${codexPath}`);
   emitLog(`Output: ${outputDir}`);
   emitLog(`Reasoning effort: ${normalizeCodexReasoningEffort(settings.codexReasoningEffort)}.`);
-  if (referenceFiles.length) {
-    emitLog(`Attached ${referenceFiles.length} reference image${referenceFiles.length === 1 ? "" : "s"}.`);
+  if (imageReferenceFiles.length) {
+    emitLog(`Attached ${imageReferenceFiles.length} image reference${imageReferenceFiles.length === 1 ? "" : "s"}.`);
+  }
+  const promptOnlyReferences = referenceFiles.length - imageReferenceFiles.length;
+  if (promptOnlyReferences > 0) {
+    emitLog(`Included ${promptOnlyReferences} prompt-only reference file${promptOnlyReferences === 1 ? "" : "s"} in the prompt context.`);
   }
 
   return new Promise<ImageGeneration[]>((resolve) => {
@@ -347,7 +355,7 @@ async function runCodexGeneration(
       return;
     }
 
-    child.stdin?.end(buildCodexImagePrompt(prompt, settings, referenceFiles));
+    child.stdin?.end(buildCodexImagePrompt(prompt, settings, referenceFiles, referenceTextContext));
     child.stdout?.on("data", (chunk: Buffer) => handleChunk("stdout", chunk));
     child.stderr?.on("data", (chunk: Buffer) => handleChunk("stderr", chunk));
     child.on("error", (error) => {
@@ -423,7 +431,7 @@ async function collectGeneratedImages(
       const entryPath = path.join(directory, entry.name);
       if (entry.isDirectory()) {
         await collectGeneratedImages(entryPath, candidates, depth - 1);
-      } else if (entry.isFile() && isImagePath(entryPath)) {
+      } else if (entry.isFile() && isGeneratedImagePath(entryPath)) {
         candidates.push({ filePath: entryPath, mtimeMs: statSync(entryPath).mtimeMs });
       }
     }
@@ -451,14 +459,30 @@ async function runOpenAiGeneration(
   const outputDir = path.join(project.outputDir, "generations", "openai", batchStamp);
   const summaryPath = path.join(outputDir, "openai-request.json");
   await mkdir(outputDir, { recursive: true });
+  const promptWithReferenceContext = await appendReferenceTextContext(prompt, referenceFiles);
+  const model = settings.openAiModel.trim() || "gpt-image-2";
+  const supportsImageReferences = !model.startsWith("dall-e");
+  const imageReferenceFiles = supportsImageReferences
+    ? referenceFiles.filter(canPrepareOpenAiImageReference).slice(0, 16)
+    : [];
+  const openAiReferenceImages = imageReferenceFiles.length
+    ? await prepareOpenAiReferenceImages(imageReferenceFiles, emitLog)
+    : [];
+  const unsupportedReferenceCount = referenceFiles.length - openAiReferenceImages.length;
 
   emitLog(`Starting OpenAI Images API batch for ${count} image${count === 1 ? "" : "s"}.`);
   emitLog(`Project: ${project.name}`);
   emitLog(`Model: ${settings.openAiModel}`);
   emitLog(`Size: ${settings.openAiSize}`);
   emitLog(`Output: ${outputDir}`);
-  if (referenceFiles.length) {
-    emitLog(`Using ${referenceFiles.length} reference image${referenceFiles.length === 1 ? "" : "s"} through the image edits endpoint.`);
+  if (openAiReferenceImages.length) {
+    emitLog(`Using ${openAiReferenceImages.length} image reference${openAiReferenceImages.length === 1 ? "" : "s"} through the image edits endpoint.`);
+  }
+  if (referenceFiles.length && !supportsImageReferences) {
+    emitLog("DALL-E models do not support PixelForge image reference attachments; supported text excerpts are appended to the prompt.");
+  }
+  if (unsupportedReferenceCount > 0) {
+    emitLog(`Stored ${unsupportedReferenceCount} reference file${unsupportedReferenceCount === 1 ? "" : "s"} that OpenAI Images cannot receive directly; supported text excerpts are appended to the prompt.`);
   }
 
   const results: ImageGeneration[] = [];
@@ -469,23 +493,25 @@ async function runOpenAiGeneration(
 
   await writeFile(summaryPath, JSON.stringify({
     model: settings.openAiModel,
-    prompt,
+    prompt: promptWithReferenceContext,
     count,
     size: settings.openAiSize,
     quality: settings.openAiQuality,
     output_format: settings.openAiFormat,
     moderation: settings.openAiModeration,
     referenceFiles: referenceFiles.map((file) => ({ name: file.name, path: file.path, mimeType: file.mimeType })),
+    imageReferenceFiles: imageReferenceFiles.map((file) => ({ name: file.name, path: file.path, mimeType: file.mimeType })),
+    sentImageReferences: openAiReferenceImages.length,
     createdAt
   }, null, 2), "utf8");
 
   for (const requestCount of requests) {
-    const endpoint = referenceFiles.length
+    const endpoint = openAiReferenceImages.length
       ? "https://api.openai.com/v1/images/edits"
       : "https://api.openai.com/v1/images/generations";
-    const body = referenceFiles.length
-      ? await buildOpenAiEditRequestBody(prompt, settings, requestCount, referenceFiles)
-      : buildOpenAiRequestBody(prompt, settings, requestCount);
+    const body = openAiReferenceImages.length
+      ? buildOpenAiEditRequestBody(promptWithReferenceContext, settings, requestCount, openAiReferenceImages)
+      : buildOpenAiRequestBody(promptWithReferenceContext, settings, requestCount);
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -556,29 +582,15 @@ function buildOpenAiRequestBody(prompt: string, settings: PixelForgeSettings, co
   };
 }
 
-async function buildOpenAiEditRequestBody(
+function buildOpenAiEditRequestBody(
   prompt: string,
   settings: PixelForgeSettings,
   count: number,
-  referenceFiles: ReferenceFile[]
-): Promise<Record<string, unknown>> {
+  images: OpenAiReferenceImage[]
+): Record<string, unknown> {
   const model = settings.openAiModel.trim() || "gpt-image-2";
   if (model.startsWith("dall-e")) {
     throw new Error("OpenAI reference images require a GPT Image model such as gpt-image-2.");
-  }
-
-  const images = [];
-  for (const referenceFile of referenceFiles.slice(0, 16)) {
-    if (!existsSync(referenceFile.path) || !["image/png", "image/jpeg", "image/webp"].includes(referenceFile.mimeType)) {
-      continue;
-    }
-    if (referenceFile.size > 20 * 1024 * 1024) {
-      continue;
-    }
-    const bytes = await readFile(referenceFile.path);
-    images.push({
-      image_url: `data:${referenceFile.mimeType};base64,${bytes.toString("base64")}`
-    });
   }
 
   if (!images.length) {
@@ -596,6 +608,110 @@ async function buildOpenAiEditRequestBody(
     moderation: settings.openAiModeration,
     input_fidelity: "high"
   };
+}
+
+async function prepareCodexImageReferenceFiles(
+  referenceFiles: ReferenceFile[],
+  outputDir: string,
+  emitLog: (message: string, stream?: "info" | "stdout" | "stderr" | "error") => void
+): Promise<ReferenceFile[]> {
+  const prepared: ReferenceFile[] = [];
+  const preparedDir = path.join(outputDir, "prepared-references");
+  for (const referenceFile of referenceFiles) {
+    if (!existsSync(referenceFile.path)) continue;
+    if (isOpenAiRasterReferenceFile(referenceFile)) {
+      prepared.push(referenceFile);
+      continue;
+    }
+    if (!isSvgReferenceFile(referenceFile.path)) continue;
+    try {
+      await mkdir(preparedDir, { recursive: true });
+      const targetPath = path.join(preparedDir, `${sanitizeFileName(path.basename(referenceFile.name, path.extname(referenceFile.name)))}-${referenceFile.id.slice(0, 8)}.png`);
+      await sharp(referenceFile.path, { density: 192 })
+        .resize({ width: 2048, height: 2048, fit: "inside", withoutEnlargement: true })
+        .png({ compressionLevel: 9, adaptiveFiltering: true })
+        .toFile(targetPath);
+      const targetSize = statSync(targetPath).size;
+      prepared.push({
+        ...referenceFile,
+        path: targetPath,
+        mimeType: "image/png",
+        size: targetSize
+      });
+      emitLog(`Prepared SVG reference for image attachment: ${referenceFile.name}`);
+    } catch (error) {
+      emitLog(`Could not prepare SVG reference ${referenceFile.name}: ${error instanceof Error ? error.message : String(error)}`, "error");
+    }
+  }
+  return prepared;
+}
+
+async function prepareOpenAiReferenceImages(
+  referenceFiles: ReferenceFile[],
+  emitLog: (message: string, stream?: "info" | "stdout" | "stderr" | "error") => void
+): Promise<OpenAiReferenceImage[]> {
+  const images: OpenAiReferenceImage[] = [];
+  for (const referenceFile of referenceFiles) {
+    try {
+      const imageUrl = await buildOpenAiReferenceImageUrl(referenceFile);
+      if (!imageUrl) {
+        emitLog(`Skipped OpenAI image reference ${referenceFile.name}; it is too large or could not be prepared.`);
+        continue;
+      }
+      images.push({ image_url: imageUrl });
+    } catch (error) {
+      emitLog(`Could not prepare OpenAI image reference ${referenceFile.name}: ${error instanceof Error ? error.message : String(error)}`, "error");
+    }
+  }
+  return images;
+}
+
+async function buildOpenAiReferenceImageUrl(referenceFile: ReferenceFile): Promise<string | null> {
+  if (!existsSync(referenceFile.path)) return null;
+  if (isOpenAiRasterReferenceFile(referenceFile)) {
+    if (referenceFile.size > openAiReferenceImageLimitBytes) return null;
+    const bytes = await readFile(referenceFile.path);
+    return `data:${referenceFile.mimeType};base64,${bytes.toString("base64")}`;
+  }
+  if (!isSvgReferenceFile(referenceFile.path)) return null;
+  const bytes = await sharp(referenceFile.path, { density: 192 })
+    .resize({ width: 2048, height: 2048, fit: "inside", withoutEnlargement: true })
+    .png({ compressionLevel: 9, adaptiveFiltering: true })
+    .toBuffer();
+  if (bytes.length > openAiReferenceImageLimitBytes) return null;
+  return `data:image/png;base64,${bytes.toString("base64")}`;
+}
+
+async function appendReferenceTextContext(prompt: string, referenceFiles: ReferenceFile[]): Promise<string> {
+  const context = await buildReferenceTextContext(referenceFiles);
+  if (!context) return prompt;
+  return [
+    prompt.trim(),
+    "",
+    "Reference document excerpts:",
+    context
+  ].join("\n");
+}
+
+async function buildReferenceTextContext(referenceFiles: ReferenceFile[]): Promise<string> {
+  const snippets: string[] = [];
+  let remaining = referenceTextTotalLimit;
+  for (const referenceFile of referenceFiles) {
+    if (remaining <= 0) break;
+    if (!existsSync(referenceFile.path) || (!isTextReferenceFile(referenceFile.path) && !isSvgReferenceFile(referenceFile.path))) continue;
+    if (referenceFile.size > referenceTextFileLimitBytes) continue;
+    try {
+      const content = (await readFile(referenceFile.path, "utf8")).replace(/\u0000/g, "").trim();
+      if (!content) continue;
+      const limit = Math.min(referenceTextSnippetLimit, remaining);
+      const excerpt = content.length > limit ? `${content.slice(0, limit)}\n[truncated]` : content;
+      snippets.push(`${referenceFile.name} (${referenceFileTypeLabel(referenceFile)}):\n${excerpt}`);
+      remaining -= excerpt.length;
+    } catch {
+      // Binary or unreadable reference files can still be stored and listed.
+    }
+  }
+  return snippets.join("\n\n");
 }
 
 function normalizeDallESize(model: string, size: string): string {
@@ -631,7 +747,7 @@ async function runLocalUpscale(
     generation.status === "completed" &&
     generation.outputPath &&
     existsSync(generation.outputPath) &&
-    isImagePath(generation.outputPath)
+    isGeneratedImagePath(generation.outputPath)
   );
   if (!candidates.length) {
     throw new Error("Select at least one completed image to upscale.");
@@ -875,10 +991,46 @@ function registerIpcHandlers(): void {
   ipcMain.handle("project:setActive", (_event, projectId: string) => store.setActiveProject(projectId));
   ipcMain.handle("project:addReferenceFiles", async (event, projectId: string) => {
     const options: Electron.OpenDialogOptions = {
-      title: "Add reference images",
+      title: "Add reference files",
       properties: ["openFile", "multiSelections"],
       filters: [
-        { name: "Images", extensions: ["png", "jpg", "jpeg", "webp"] }
+        {
+          name: "Reference files",
+          extensions: [
+            "png",
+            "jpg",
+            "jpeg",
+            "webp",
+            "gif",
+            "svg",
+            "pdf",
+            "txt",
+            "md",
+            "markdown",
+            "csv",
+            "tsv",
+            "json",
+            "jsonl",
+            "html",
+            "htm",
+            "css",
+            "xml",
+            "yaml",
+            "yml",
+            "rtf",
+            "doc",
+            "docx",
+            "ppt",
+            "pptx",
+            "xls",
+            "xlsx",
+            "ai",
+            "eps",
+            "psd",
+            "fig",
+            "sketch"
+          ]
+        }
       ]
     };
     const window = BrowserWindow.fromWebContents(event.sender);
@@ -891,7 +1043,7 @@ function registerIpcHandlers(): void {
       if (!project) throw new Error("Project not found.");
       return project;
     }
-    const supportedFiles = result.filePaths.filter(isSupportedReferenceImage);
+    const supportedFiles = result.filePaths.filter(isSupportedReferenceFile);
     return store.addReferenceFiles(projectId, supportedFiles);
   });
   ipcMain.handle("project:removeReferenceFile", (_event, projectId: string, referenceId: string) =>
@@ -975,7 +1127,7 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle("asset:url", async (_event, filePath: string) => {
-    if (!existsSync(filePath) || !isImagePath(filePath)) return "";
+    if (!existsSync(filePath) || !isPreviewableReferenceFile(filePath)) return "";
     const token = tokenForAsset(filePath);
     return `http://127.0.0.1:${assetServerPort}/asset/${token}`;
   });

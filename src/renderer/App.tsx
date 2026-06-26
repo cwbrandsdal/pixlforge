@@ -7,7 +7,9 @@ import {
   Cloud,
   Copy,
   ExternalLink,
+  File,
   FileImage,
+  FileText,
   FolderOpen,
   Image as ImageIcon,
   Images,
@@ -294,9 +296,9 @@ function App() {
     try {
       const updated = await window.pixelforge.addProjectReferenceFiles(selectedProject.id);
       setProjects((current) => current.map((project) => project.id === updated.id ? updated : project));
-      setStatus("Reference images updated");
+      setStatus("Reference files updated");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not add reference images");
+      setStatus(error instanceof Error ? error.message : "Could not add reference files");
     }
   }
 
@@ -305,9 +307,9 @@ function App() {
     try {
       const updated = await window.pixelforge.removeProjectReferenceFile(selectedProject.id, reference.id);
       setProjects((current) => current.map((project) => project.id === updated.id ? updated : project));
-      setStatus("Reference image removed");
+      setStatus("Reference file removed");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not remove reference image");
+      setStatus(error instanceof Error ? error.message : "Could not remove reference file");
     }
   }
 
@@ -581,24 +583,24 @@ function App() {
             </div>
             <button type="button" className="upload-button" disabled={!selectedProject} onClick={() => void addReferenceFiles()}>
               <Upload size={17} />
-              Upload images
+              Add files
             </button>
             <div className="reference-list">
               {selectedProject?.referenceFiles.length ? selectedProject.referenceFiles.map((reference) => (
                 <div className="reference-item" key={reference.id}>
                   <div className="reference-thumb">
-                    {assetUrls[reference.path] ? <img src={assetUrls[reference.path]} alt="" /> : <FileImage size={18} />}
+                    {assetUrls[reference.path] ? <img src={assetUrls[reference.path]} alt="" /> : referenceIcon(reference)}
                   </div>
                   <div>
                     <strong>{reference.name}</strong>
-                    <span>{formatBytes(reference.size)}</span>
+                    <span>{referenceFileMeta(reference)}</span>
                   </div>
                   <button type="button" title="Remove reference" onClick={() => void removeReferenceFile(reference)}>
                     <X size={14} />
                   </button>
                 </div>
               )) : (
-                <p className="empty-reference">No reference images attached.</p>
+                <p className="empty-reference">No reference files attached.</p>
               )}
             </div>
           </div>
@@ -773,6 +775,27 @@ function generationTitle(generation: ImageGeneration): string {
   if (generation.provider === "codex") return `Codex Draft #${generation.index}`;
   if (generation.provider === "openai") return `OpenAI Draft #${generation.index}`;
   return `PixelForge #${generation.index}`;
+}
+
+function referenceIcon(reference: ReferenceFile): React.ReactNode {
+  if (reference.mimeType.startsWith("image/")) return <FileImage size={18} />;
+  if (reference.mimeType.startsWith("text/") || reference.mimeType.includes("json") || reference.mimeType.includes("xml")) {
+    return <FileText size={18} />;
+  }
+  return <File size={18} />;
+}
+
+function referenceFileMeta(reference: ReferenceFile): string {
+  return `${referenceFileType(reference)} - ${formatBytes(reference.size)}`;
+}
+
+function referenceFileType(reference: ReferenceFile): string {
+  const extension = reference.name.includes(".") ? reference.name.split(".").pop()?.toUpperCase() : "";
+  if (extension) return extension;
+  if (reference.mimeType.startsWith("image/")) return "Image";
+  if (reference.mimeType.startsWith("text/")) return "Text";
+  if (reference.mimeType === "application/pdf") return "PDF";
+  return "Document";
 }
 
 function SettingsView({

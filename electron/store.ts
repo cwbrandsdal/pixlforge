@@ -2,6 +2,7 @@ import { app, safeStorage } from "electron";
 import { copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import { isSupportedReferenceFile, mimeTypeForReferenceFile } from "./reference-files.js";
 import type { ImageGeneration, PixelForgeProject, PixelForgeSettings, PixelForgeState, ReferenceFile, SecretStatus } from "./types.js";
 
 const defaultSettings: PixelForgeSettings = {
@@ -155,7 +156,7 @@ export class PixelForgeStore {
 
     const added: ReferenceFile[] = [];
     for (const sourcePath of filePaths) {
-      if (!isSupportedReferenceImage(sourcePath)) continue;
+      if (!isSupportedReferenceFile(sourcePath)) continue;
       const sourceStat = await stat(sourcePath);
       if (!sourceStat.isFile()) continue;
       const extension = path.extname(sourcePath).toLowerCase();
@@ -167,7 +168,7 @@ export class PixelForgeStore {
         id,
         name,
         path: targetPath,
-        mimeType: mimeTypeForFile(targetPath),
+        mimeType: mimeTypeForReferenceFile(targetPath),
         size: sourceStat.size,
         addedAt: new Date().toISOString()
       });
@@ -350,7 +351,7 @@ function normalizeReferenceFile(value: Partial<ReferenceFile>): ReferenceFile | 
     id: value.id,
     name: value.name ?? path.basename(value.path),
     path: value.path,
-    mimeType: value.mimeType ?? mimeTypeForFile(value.path),
+    mimeType: value.mimeType ?? mimeTypeForReferenceFile(value.path),
     size: value.size ?? 0,
     addedAt: value.addedAt ?? new Date().toISOString()
   };
@@ -391,16 +392,4 @@ function sanitizeFileName(value: string): string {
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 80) || "pixelforge";
-}
-
-function isSupportedReferenceImage(filePath: string): boolean {
-  return [".png", ".jpg", ".jpeg", ".webp"].includes(path.extname(filePath).toLowerCase());
-}
-
-function mimeTypeForFile(filePath: string): string {
-  const extension = path.extname(filePath).toLowerCase();
-  if (extension === ".png") return "image/png";
-  if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
-  if (extension === ".webp") return "image/webp";
-  return "application/octet-stream";
 }

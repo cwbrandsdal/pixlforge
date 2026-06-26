@@ -1,7 +1,7 @@
 {
   "name": "pixelforge",
   "productName": "PixelForge",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Desktop prompt-to-image batch generator powered by Codex CLI and the OpenAI Images API.",
   "main": "dist-electron/main.js",
   "type": "module",
